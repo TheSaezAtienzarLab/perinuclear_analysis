@@ -1,0 +1,14 @@
+data/
+manual_coloc.xlsx
+
+
+//Template for python files
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pywzw
+*.pyzwzw
