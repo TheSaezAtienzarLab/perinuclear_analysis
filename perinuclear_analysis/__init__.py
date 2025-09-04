@@ -20,25 +20,32 @@ PHASE_STATUS = {
 }
 
 # Phase 1 imports - Always available
-from .config import Config, Phase1Config
-from .image_loader import ImageLoader
-from .utils import (
+from .core import Config, Phase1Config
+from .data_processing import ImageLoader
+from .core import (
     validate_file_path,
     get_pixel_size_from_metadata,
     convert_pixels_to_microns,
     convert_microns_to_pixels,
+    get_fluorophore_color,
+    create_channel_color_mapping,
+    get_colormap_from_fluorophore,
 )
 
 # Phase 2 imports
 if PHASE_STATUS["phase2"]:
-    from .mip_creator import MIPCreator
+    from .data_processing import MIPCreator
+    try:
+        from .mip_preprocessor import MIPPreprocessor
+    except ImportError:
+        warnings.warn("MIPPreprocessor not available yet")
+        MIPPreprocessor = None
     from .visualization import Visualizer, plot_mip, plot_channels
 
 # Phase 3 imports
 if PHASE_STATUS["phase3"]:
     try:
-        from .cell_segmentation import CellSegmenter
-        from .nuclei_detection import NucleiDetector
+        from .analysis import CellSegmenter, NucleiDetector
     except ImportError as e:
         warnings.warn(
             f"Phase 3 dependencies not installed: {e}\n"
@@ -56,6 +63,7 @@ if PHASE_STATUS["phase4"]:
             "Install with: pip install .[phase4]"
         )
         PHASE_STATUS["phase4"] = False
+        RingAnalyzer = None
 
 # Phase 5 imports
 if PHASE_STATUS["phase5"]:
@@ -68,6 +76,8 @@ if PHASE_STATUS["phase5"]:
             "Install with: pip install .[phase5]"
         )
         PHASE_STATUS["phase5"] = False
+        SignalQuantifier = None
+        PerinuclearAnalyzer = None
 
 
 def check_phase_status() -> Dict[str, bool]:
@@ -190,16 +200,17 @@ __all__ = [
     "get_pixel_size_from_metadata",
     "convert_pixels_to_microns",
     "convert_microns_to_pixels",
+    "get_fluorophore_color",
+    "create_channel_color_mapping",
+    "get_colormap_from_fluorophore",
 ]
 
 # Add phase-specific exports
 if PHASE_STATUS["phase2"]:
-    __all__.extend([
-        "MIPCreator",
-        "Visualizer",
-        "plot_mip",
-        "plot_channels",
-    ])
+    phase2_exports = ["MIPCreator", "Visualizer", "plot_mip", "plot_channels"]
+    if MIPPreprocessor is not None:
+        phase2_exports.append("MIPPreprocessor")
+    __all__.extend(phase2_exports)
 
 if PHASE_STATUS["phase3"]:
     __all__.extend([
@@ -207,13 +218,15 @@ if PHASE_STATUS["phase3"]:
         "NucleiDetector",
     ])
 
-if PHASE_STATUS["phase4"]:
+if PHASE_STATUS["phase4"] and RingAnalyzer is not None:
     __all__.extend([
         "RingAnalyzer",
     ])
 
 if PHASE_STATUS["phase5"]:
-    __all__.extend([
-        "SignalQuantifier",
-        "PerinuclearAnalyzer",
-    ])
+    phase5_exports = []
+    if SignalQuantifier is not None:
+        phase5_exports.append("SignalQuantifier")
+    if PerinuclearAnalyzer is not None:
+        phase5_exports.append("PerinuclearAnalyzer")
+    __all__.extend(phase5_exports)
