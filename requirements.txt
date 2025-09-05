@@ -12,6 +12,10 @@ tifffile>=2023.7.10
 # cupy-cuda11x>=11.0.0  # For CUDA 11.x (alternative to above)
 # cupyx-scipy>=12.0.0   # GPU-accelerated scipy functions
 
+# Conda installation for CUDA dependencies:
+# conda install -c conda-forge cupy  # For CUDA support
+# conda install -c conda-forge cupyx-scipy  # GPU-accelerated scipy functions
+
 # Phase 2 dependencies (MIP creation and visualization)
 # (Already covered by Phase 1)
 
