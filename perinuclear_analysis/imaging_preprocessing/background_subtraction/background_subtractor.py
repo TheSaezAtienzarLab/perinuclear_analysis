@@ -9,10 +9,12 @@ Optimized for M3 Pro MacBook (18GB memory) with memory-efficient chunk processin
 """
 
 import logging
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import gc
 
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from skimage import filters, morphology
 
 from ...core.config import BackgroundSubtractionConfig, PreprocessingConfig
@@ -552,3 +554,256 @@ class BackgroundSubtractor:
                 'radius': self.config.rolling_ball_radius_protein,
                 'description': 'Protein marker - standard radius for punctate/diffuse patterns'
             }
+    
+    def plot_background_subtraction_comparison(self, 
+                                             original_data: np.ndarray,
+                                             corrected_results: Dict[str, Tuple[np.ndarray, Dict]],
+                                             channel_names: List[str],
+                                             z_slice: Optional[int] = None,
+                                             figsize: Optional[Tuple[int, int]] = None) -> Figure:
+        """
+        Create a detailed comparison plot showing original vs background-subtracted images.
+        
+        This method generates a comprehensive visualization with:
+        - Original and corrected images side by side
+        - Intensity histograms for both original and corrected data
+        - Statistics and method information for each channel
+        
+        Args:
+            original_data: Original 3D image data (Z, Y, X, C) from ImageLoader
+            corrected_results: Dictionary mapping channel names to (corrected_image, metadata) tuples.
+                              Can come from batch_process(), individual subtract_background() calls,
+                              or any custom processing results.
+            channel_names: List of channel names corresponding to the data
+            z_slice: Z-slice index to display. If None, uses middle slice
+            figsize: Figure size tuple (width, height). If None, auto-calculates
+            
+        Returns:
+            Figure: Matplotlib figure object for further customization
+            
+        Examples:
+            # From batch processing:
+            >>> results = bg_subtractor.batch_process(images_dict, pixel_size)
+            >>> fig = bg_subtractor.plot_background_subtraction_comparison(
+            ...     loaded_data, results, channel_names
+            ... )
+            
+            # From individual processing:
+            >>> corrected_img, metadata = bg_subtractor.subtract_background(
+            ...     channel_data, channel_name="DAPI", pixel_size=pixel_size
+            ... )
+            >>> results = {"DAPI": (corrected_img, metadata)}
+            >>> fig = bg_subtractor.plot_background_subtraction_comparison(
+            ...     loaded_data, results, ["DAPI"]
+            ... )
+            
+            # Compare different parameter settings:
+            >>> results1 = {"DAPI": bg_subtractor.subtract_background(data, radius=50, ...)}
+            >>> results2 = {"DAPI": bg_subtractor.subtract_background(data, radius=100, ...)}
+            >>> # Plot each separately to compare
+        """
+        if z_slice is None:
+            z_slice = original_data.shape[0] // 2
+        
+        n_channels = len(channel_names)
+        
+        # Auto-calculate figure size if not provided
+        if figsize is None:
+            figsize = (5 * n_channels, 12)
+        
+        # Create subplots: 3 rows (original, corrected, histogram) x n_channels
+        fig, axes = plt.subplots(3, n_channels, figsize=figsize)
+        
+        # Handle single channel case
+        if n_channels == 1:
+            axes = axes.reshape(-1, 1)
+        
+        for i, channel_name in enumerate(channel_names):
+            # Get data for this channel
+            original_channel = original_data[:, :, :, i]
+            corrected_img, metadata = corrected_results[channel_name]
+            
+            # Calculate display ranges using percentiles for better visualization
+            orig_p1, orig_p99 = np.percentile(original_channel, [1, 99])
+            corr_p1, corr_p99 = np.percentile(corrected_img, [1, 99])
+            
+            # Row 1: Original images
+            im_orig = axes[0, i].imshow(original_channel[z_slice], 
+                                       cmap='viridis', 
+                                       vmin=orig_p1, vmax=orig_p99)
+            axes[0, i].set_title(f'Original {channel_name}', fontsize=12, fontweight='bold')
+            axes[0, i].axis('off')
+            plt.colorbar(im_orig, ax=axes[0, i], shrink=0.8, label='Intensity')
+            
+            # Row 2: Corrected images
+            im_corr = axes[1, i].imshow(corrected_img[z_slice], 
+                                       cmap='viridis', 
+                                       vmin=corr_p1, vmax=corr_p99)
+            
+            # Create informative title with method and parameters
+            method = metadata['method']
+            params = metadata.get('parameters_used', {})
+            if method == 'rolling_ball':
+                radius = params.get('radius', 'N/A')
+                title = f'Corrected {channel_name}\n{method} (radius={radius})'
+            elif method == 'gaussian':
+                sigma = params.get('sigma', 'N/A')
+                title = f'Corrected {channel_name}\n{method} (σ={sigma})'
+            else:
+                title = f'Corrected {channel_name}\n{method}'
+            
+            axes[1, i].set_title(title, fontsize=12, fontweight='bold')
+            axes[1, i].axis('off')
+            plt.colorbar(im_corr, ax=axes[1, i], shrink=0.8, label='Intensity')
+            
+            # Row 3: Histograms
+            # Sample data for histogram (every 10th pixel to speed up plotting)
+            orig_sample = original_channel.flatten()[::10]
+            corr_sample = corrected_img.flatten()[::10]
+            
+            # Calculate statistics for display
+            orig_mean = np.mean(orig_sample)
+            orig_std = np.std(orig_sample)
+            corr_mean = np.mean(corr_sample)
+            corr_std = np.std(corr_sample)
+            
+            axes[2, i].hist(orig_sample, bins=50, alpha=0.7, label='Original', 
+                           density=True, color='blue', edgecolor='black', linewidth=0.5)
+            axes[2, i].hist(corr_sample, bins=50, alpha=0.7, label='Corrected', 
+                           density=True, color='red', edgecolor='black', linewidth=0.5)
+            
+            # Add statistics text
+            stats_text = (f'Original: {orig_mean:.1f} ± {orig_std:.1f}\n'
+                         f'Corrected: {corr_mean:.1f} ± {corr_std:.1f}')
+            axes[2, i].text(0.02, 0.98, stats_text, transform=axes[2, i].transAxes,
+                           verticalalignment='top', fontsize=9, 
+                           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            axes[2, i].set_title(f'{channel_name} Intensity Distribution', fontsize=11)
+            axes[2, i].set_yscale('log')
+            axes[2, i].legend(fontsize=10)
+            axes[2, i].set_xlabel('Intensity', fontsize=10)
+            axes[2, i].set_ylabel('Density (log)', fontsize=10)
+            axes[2, i].grid(True, alpha=0.3)
+        
+        # Add overall title
+        fig.suptitle(f'Background Subtraction Analysis - Z-slice {z_slice}', 
+                    fontsize=16, fontweight='bold', y=0.98)
+        
+        # Adjust layout to prevent overlap
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.93)  # Make room for suptitle
+        
+        return fig
+    
+    def compare_parameter_settings(self,
+                                 original_data: np.ndarray,
+                                 channel_name: str,
+                                 channel_index: int,
+                                 parameter_sets: List[Dict[str, Any]],
+                                 pixel_size: float,
+                                 z_slice: Optional[int] = None,
+                                 figsize: Optional[Tuple[int, int]] = None) -> Figure:
+        """
+        Compare different parameter settings for background subtraction on a single channel.
+        
+        This is useful for parameter optimization - you can test different radius values,
+        methods, or other parameters and see their effects side by side.
+        
+        Args:
+            original_data: Original 3D image data (Z, Y, X, C) from ImageLoader
+            channel_name: Name of the channel to process
+            channel_index: Index of the channel in the original data
+            parameter_sets: List of parameter dictionaries to test
+            pixel_size: Pixel size in micrometers
+            z_slice: Z-slice index to display. If None, uses middle slice
+            figsize: Figure size tuple (width, height). If None, auto-calculates
+            
+        Returns:
+            Figure: Matplotlib figure object showing comparison of all parameter sets
+            
+        Example:
+            >>> parameter_sets = [
+            ...     {'method': 'rolling_ball', 'radius': 50},
+            ...     {'method': 'rolling_ball', 'radius': 100},
+            ...     {'method': 'rolling_ball', 'radius': 150},
+            ...     {'method': 'gaussian', 'sigma': 2.0}
+            ... ]
+            >>> fig = bg_subtractor.compare_parameter_settings(
+            ...     loaded_data, "DAPI", 0, parameter_sets, pixel_size
+            ... )
+        """
+        if z_slice is None:
+            z_slice = original_data.shape[0] // 2
+        
+        n_params = len(parameter_sets)
+        
+        # Auto-calculate figure size if not provided
+        if figsize is None:
+            figsize = (5 * n_params, 10)
+        
+        # Create subplots: 2 rows (original, corrected) x n_params
+        fig, axes = plt.subplots(2, n_params, figsize=figsize)
+        
+        # Handle single parameter case
+        if n_params == 1:
+            axes = axes.reshape(-1, 1)
+        
+        # Get original channel data
+        original_channel = original_data[:, :, :, channel_index]
+        orig_p1, orig_p99 = np.percentile(original_channel, [1, 99])
+        
+        # Process each parameter set
+        for i, params in enumerate(parameter_sets):
+            # Process with these parameters
+            corrected_img, metadata = self.subtract_background(
+                image=original_channel,
+                channel_name=channel_name,
+                pixel_size=pixel_size,
+                **params
+            )
+            
+            # Calculate display range for corrected image
+            corr_p1, corr_p99 = np.percentile(corrected_img, [1, 99])
+            
+            # Row 1: Original image (show only once, in first column)
+            if i == 0:
+                im_orig = axes[0, i].imshow(original_channel[z_slice], 
+                                           cmap='viridis', 
+                                           vmin=orig_p1, vmax=orig_p99)
+                axes[0, i].set_title(f'Original {channel_name}', fontsize=12, fontweight='bold')
+                axes[0, i].axis('off')
+                plt.colorbar(im_orig, ax=axes[0, i], shrink=0.8, label='Intensity')
+            else:
+                axes[0, i].axis('off')  # Hide other original images
+            
+            # Row 2: Corrected images
+            im_corr = axes[1, i].imshow(corrected_img[z_slice], 
+                                       cmap='viridis', 
+                                       vmin=corr_p1, vmax=corr_p99)
+            
+            # Create informative title with parameters
+            method = metadata['method']
+            params_used = metadata.get('parameters_used', {})
+            if method == 'rolling_ball':
+                radius = params_used.get('radius', 'N/A')
+                title = f'{method}\nradius={radius}'
+            elif method == 'gaussian':
+                sigma = params_used.get('sigma', 'N/A')
+                title = f'{method}\nσ={sigma}'
+            else:
+                title = f'{method}'
+            
+            axes[1, i].set_title(title, fontsize=11, fontweight='bold')
+            axes[1, i].axis('off')
+            plt.colorbar(im_corr, ax=axes[1, i], shrink=0.8, label='Intensity')
+        
+        # Add overall title
+        fig.suptitle(f'Parameter Comparison - {channel_name} (Z-slice {z_slice})', 
+                    fontsize=16, fontweight='bold', y=0.95)
+        
+        # Adjust layout
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.90)
+        
+        return fig
