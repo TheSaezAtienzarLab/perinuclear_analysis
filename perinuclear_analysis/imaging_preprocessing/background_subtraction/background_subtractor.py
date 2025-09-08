@@ -6,9 +6,8 @@ confocal z-stack images with different channel types. Follows the critical first
 in the preprocessing pipeline: background subtraction → denoising → deconvolution.
 
 Features:
-- CUDA acceleration for 10-50x speedup on compatible GPUs
-- Automatic CPU fallback when CUDA is not available
-- Memory-efficient processing with chunk-based operations
+- CUDA-only implementation (requires CuPy/CUDA)
+- Memory-efficient processing with chunk-based operations (GPU-aware)
 - Channel-specific parameter auto-selection
 - Integration with existing ImageLoader workflow
 
@@ -18,7 +17,6 @@ Input: 3D numpy arrays (Z, Y, X) from ome.tiff files
 import logging
 from typing import Dict, Any, Optional, Tuple, List
 import gc
-import warnings
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -41,7 +39,7 @@ except ImportError:
     cp = None
     cp_ndimage = None
     logger = logging.getLogger(__name__)
-    logger.info("CUDA libraries not available - using CPU implementation")
+    logger.error("CUDA libraries not available - this module requires CUDA (CuPy)")
 
 logger = logging.getLogger(__name__)
 
@@ -77,17 +75,12 @@ class BackgroundSubtractor:
         self.config = config or BackgroundSubtractionConfig()
         self.logger = logging.getLogger(__name__)
         
-        # Determine CUDA usage
-        if use_cuda is None:
-            self.use_cuda = CUDA_AVAILABLE
-        else:
-            self.use_cuda = use_cuda and CUDA_AVAILABLE
-            
-        if self.use_cuda:
-            self.logger.info("Initializing CUDA-accelerated background subtractor")
-            self._initialize_cuda()
-        else:
-            self.logger.info("Using CPU implementation for background subtraction")
+        # Enforce CUDA-only usage
+        self.use_cuda = True
+        if not CUDA_AVAILABLE:
+            raise RuntimeError("CUDA libraries not available; BackgroundSubtractor requires CUDA (CuPy)")
+        self.logger.info("Initializing CUDA-accelerated background subtractor (CUDA required)")
+        self._initialize_cuda()
     
     def _initialize_cuda(self) -> None:
         """Initialize CUDA context and check GPU memory."""
@@ -111,8 +104,7 @@ class BackgroundSubtractor:
             
         except Exception as e:
             self.logger.error(f"Failed to initialize CUDA: {e}")
-            self.use_cuda = False
-            warnings.warn("CUDA initialization failed, falling back to CPU")
+            raise RuntimeError(f"CUDA initialization failed: {e}")
         
     def subtract_background(
         self,
@@ -143,12 +135,8 @@ class BackgroundSubtractor:
         
         method = method or self.config.method
         
-        if self.use_cuda:
-            self.logger.info(f"Applying CUDA-accelerated {method} background subtraction to 3D image {image.shape}")
-            return self._subtract_background_cuda(image, method, channel_name, pixel_size, **kwargs)
-        else:
-            self.logger.info(f"Applying CPU {method} background subtraction to 3D image {image.shape}")
-            return self._subtract_background_cpu(image, method, channel_name, pixel_size, chunk_size, **kwargs)
+        self.logger.info(f"Applying CUDA {method} background subtraction to 3D image {image.shape}")
+        return self._subtract_background_cuda(image, method, channel_name, pixel_size, **kwargs)
     
     def _subtract_background_cuda(
         self,
@@ -163,8 +151,8 @@ class BackgroundSubtractor:
             # Check if image fits in GPU memory
             image_memory_gb = image.nbytes / (1024**3)
             if image_memory_gb > self.max_gpu_memory_gb:
-                self.logger.warning(f"Image too large for GPU memory ({image_memory_gb:.1f}GB > {self.max_gpu_memory_gb:.1f}GB), using CPU")
-                return self._subtract_background_cpu(image, method, channel_name, pixel_size, None, **kwargs)
+                self.logger.error(f"Image too large for GPU memory ({image_memory_gb:.1f}GB > {self.max_gpu_memory_gb:.1f}GB)")
+                raise MemoryError("Input image exceeds available GPU memory. Consider reducing image size or parameters.")
             
             # Transfer image to GPU
             gpu_image = cp.asarray(image, dtype=cp.float32)
@@ -212,8 +200,7 @@ class BackgroundSubtractor:
             
         except Exception as e:
             self.logger.error(f"CUDA processing failed: {e}")
-            self.logger.info("Falling back to CPU implementation")
-            return self._subtract_background_cpu(image, method, channel_name, pixel_size, None, **kwargs)
+            raise
     
     def _subtract_background_cpu(
         self,
@@ -382,7 +369,8 @@ class BackgroundSubtractor:
             
             # Process each slice in the chunk
             for z in range(start_z, end_z):
-                background = self._create_rolling_ball_background(image[z], radius)
+                light_background = params.get('light_background', False)
+                background = self._create_rolling_ball_background(image[z], radius, light_background)
                 corrected_image[z] = image[z].astype(np.float32) - background
                 
                 # Collect background statistics
@@ -414,23 +402,62 @@ class BackgroundSubtractor:
         
         return corrected_image, metadata
     
-    def _create_rolling_ball_background(self, image: np.ndarray, radius: int) -> np.ndarray:
+    def _create_rolling_ball_background(self, image: np.ndarray, radius: int, light_background: bool = False) -> np.ndarray:
         """
-        Create rolling ball background using morphological operations.
+        Create rolling ball background using proper rolling ball algorithm.
         
-        This implementation uses morphological opening with a disk-shaped
-        structuring element, which approximates the rolling ball algorithm.
+        Uses the opencv-rolling-ball package which is ported from ImageJ's Background Subtractor.
+        This is the most accurate implementation of the rolling ball algorithm.
         """
-        # Create disk-shaped structuring element
-        selem = morphology.disk(radius)
+        import time
+        start_time = time.time()
         
-        # Morphological opening (erosion followed by dilation)
-        background = morphology.opening(image, selem)
+        # Check if image is too large and suggest downsampling
+        if image.shape[0] > 1000 or image.shape[1] > 1000:
+            self.logger.warning(f"Large image detected ({image.shape}). Rolling ball may be slow. Consider using smaller radius or downsampling.")
         
-        # Smooth the background to reduce artifacts
-        background = filters.gaussian(background, sigma=radius/10)
+        try:
+            from cv2_rolling_ball import subtract_background_rolling_ball
+        except ImportError:
+            # Fallback to scikit-image if opencv-rolling-ball is not available
+            from skimage import restoration
+            self.logger.warning("opencv-rolling-ball not available, falling back to scikit-image")
+            
+            if image.dtype != np.float64:
+                image = image.astype(np.float64)
+            background = restoration.rolling_ball(image, radius=radius, light_background=light_background)
+            return background.astype(np.float32)
         
-        return background
+        # Convert to 8-bit if needed (opencv-rolling-ball requirement)
+        if image.dtype != np.uint8:
+            # Normalize to 0-255 range
+            img_min, img_max = image.min(), image.max()
+            if img_max > img_min:
+                image_8bit = ((image - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+            else:
+                image_8bit = np.zeros_like(image, dtype=np.uint8)
+        else:
+            image_8bit = image
+        
+        self.logger.info(f"Starting rolling ball background subtraction (radius={radius}, size={image.shape})")
+        
+        # Use opencv-rolling-ball implementation
+        corrected_img, background = subtract_background_rolling_ball(
+            image_8bit, 
+            radius, 
+            light_background=light_background,
+            use_paraboloid=False,  # Use rolling ball, not paraboloid
+            do_presmooth=True
+        )
+        
+        elapsed_time = time.time() - start_time
+        self.logger.info(f"Rolling ball completed in {elapsed_time:.2f}s")
+        
+        # Convert background back to original data type and range
+        if image.dtype != np.uint8:
+            background = background.astype(np.float32) / 255.0 * (img_max - img_min) + img_min
+        
+        return background.astype(np.float32)
     
     def _gaussian_subtraction_3d(
         self, 
@@ -561,52 +588,64 @@ class BackgroundSubtractor:
         gpu_image: cp.ndarray, 
         params: Dict[str, Any]
     ) -> Tuple[cp.ndarray, Dict[str, Any]]:
-        """CUDA-accelerated rolling ball background subtraction."""
+        """CUDA-accelerated rolling ball background subtraction (morphological approximation).
+
+        Approximates ImageJ-style rolling-ball using greyscale morphology with a disk footprint.
+        Uses opening for dark background (typical) and closing if light_background=True.
+        """
         radius = params['radius']
         z_slices, height, width = gpu_image.shape
         
-        self.logger.info(f"Processing {z_slices} z-slices with CUDA rolling ball (radius={radius})")
+        self.logger.info(f"Processing {z_slices} z-slices with CUDA rolling ball approximation (radius={radius})")
+        
+        # Create structuring element (disk) once on GPU
+        selem = self._create_disk_selem_cuda(radius)
         
         # Pre-allocate output array on GPU
         corrected_image = cp.empty_like(gpu_image, dtype=cp.float32)
         
-        # Process all slices in parallel on GPU
-        for z in range(z_slices):
-            # Create rolling ball background using CUDA morphological operations
-            background = self._create_rolling_ball_background_cuda(gpu_image[z], radius)
-            corrected_image[z] = gpu_image[z] - background
+        background_means: List[float] = []
+        background_stds: List[float] = []
+        light_background = params.get('light_background', False)
         
-        # Calculate background statistics on GPU
-        background_mean = float(cp.mean(gpu_image))
-        background_std = float(cp.std(gpu_image))
+        # Process slices
+        for z in range(z_slices):
+            if light_background:
+                background = cp_ndimage.grey_closing(gpu_image[z], footprint=selem)
+            else:
+                background = cp_ndimage.grey_opening(gpu_image[z], footprint=selem)
+            corrected_image[z] = gpu_image[z].astype(cp.float32) - background.astype(cp.float32)
+            background_means.append(float(cp.mean(background)))
+            background_stds.append(float(cp.std(background)))
         
         metadata = {
             'background_method': 'rolling_ball_3d_cuda',
             'radius_pixels': radius,
             'z_slices_processed': z_slices,
             'background_stats': {
-                'mean_across_slices': background_mean,
-                'std_across_slices': background_std,
+                'mean_across_slices': float(np.mean(background_means)),
+                'std_across_slices': float(np.mean(background_stds)),
                 'gpu_processing': True
             }
         }
         
         return corrected_image, metadata
     
-    def _create_rolling_ball_background_cuda(self, gpu_slice: cp.ndarray, radius: int) -> cp.ndarray:
-        """Create rolling ball background using CUDA morphological operations."""
-        # Create disk-shaped structuring element on GPU
-        selem = self._create_disk_selem_cuda(radius)
+    def _create_rolling_ball_background_cuda(self, gpu_slice: cp.ndarray, radius: int, light_background: bool = False) -> cp.ndarray:
+        """Create rolling ball background on GPU using proper rolling ball algorithm."""
+        # For CUDA, we need to fall back to CPU implementation since scikit-image's rolling_ball
+        # doesn't have a GPU version. Transfer to CPU, process, and transfer back.
         
-        # Morphological opening (erosion followed by dilation) on GPU
-        background = cp_ndimage.binary_erosion(gpu_slice, structure=selem)
-        background = cp_ndimage.binary_dilation(background, structure=selem)
+        # Transfer to CPU
+        cpu_slice = cp.asnumpy(gpu_slice)
         
-        # Convert back to float and smooth with Gaussian
-        background = background.astype(cp.float32)
-        background = cp_ndimage.gaussian_filter(background, sigma=radius/10)
+        # Use the corrected CPU implementation
+        cpu_background = self._create_rolling_ball_background(cpu_slice, radius, light_background)
         
-        return background
+        # Transfer back to GPU
+        gpu_background = cp.asarray(cpu_background, dtype=cp.float32)
+        
+        return gpu_background
     
     def _create_disk_selem_cuda(self, radius: int) -> cp.ndarray:
         """Create disk-shaped structuring element on GPU."""
@@ -677,18 +716,14 @@ class BackgroundSubtractor:
         # Pre-allocate output array on GPU
         corrected_image = cp.empty_like(gpu_image, dtype=cp.float32)
         
-        # Process all slices in parallel on GPU
+        # Process all slices on GPU using greyscale morphology
+        background_means: List[float] = []
+        background_stds: List[float] = []
         for z in range(z_slices):
-            # Morphological closing to estimate background
-            background = cp_ndimage.binary_dilation(gpu_image[z], structure=selem)
-            background = cp_ndimage.binary_erosion(background, structure=selem)
-            background = background.astype(cp.float32)
-            
-            corrected_image[z] = gpu_image[z].astype(cp.float32) - background
-        
-        # Calculate statistics on GPU
-        bg_mean = float(cp.mean(gpu_image))
-        bg_std = float(cp.std(gpu_image))
+            background = cp_ndimage.grey_closing(gpu_image[z], footprint=selem)
+            corrected_image[z] = gpu_image[z].astype(cp.float32) - background.astype(cp.float32)
+            background_means.append(float(cp.mean(background)))
+            background_stds.append(float(cp.std(background)))
         
         metadata = {
             'background_method': 'morphological_3d_cuda',
@@ -696,8 +731,8 @@ class BackgroundSubtractor:
             'shape': shape,
             'z_slices_processed': z_slices,
             'background_stats': {
-                'mean_across_slices': bg_mean,
-                'std_across_slices': bg_std,
+                'mean_across_slices': float(np.mean(background_means)),
+                'std_across_slices': float(np.mean(background_stds)),
                 'gpu_processing': True
             }
         }
@@ -1135,7 +1170,7 @@ class BackgroundSubtractor:
             }
     
     def benchmark_methods(self, image: np.ndarray, channel_name: str = "test") -> Dict[str, Any]:
-        """Benchmark CPU vs GPU performance for different methods."""
+        """Benchmark GPU performance for different methods (CUDA-only)."""
         import time
         
         results = {}
@@ -1144,46 +1179,22 @@ class BackgroundSubtractor:
         for method in methods:
             self.logger.info(f"Benchmarking {method} method...")
             
-            # Test GPU performance
-            if self.use_cuda:
-                start_time = time.time()
-                try:
-                    gpu_result, gpu_metadata = self._subtract_background_cuda(
-                        image, method, channel_name, None
-                    )
-                    gpu_time = time.time() - start_time
-                    results[f'{method}_gpu'] = {
-                        'time_seconds': gpu_time,
-                        'success': True,
-                        'metadata': gpu_metadata
-                    }
-                except Exception as e:
-                    results[f'{method}_gpu'] = {
-                        'time_seconds': None,
-                        'success': False,
-                        'error': str(e)
-                    }
-            
-            # Test CPU performance
+            # Test GPU performance only
             start_time = time.time()
             try:
-                cpu_result, cpu_metadata = self._subtract_background_cpu(
-                    image, method, channel_name, None, None
+                gpu_result, gpu_metadata = self._subtract_background_cuda(
+                    image, method, channel_name, None
                 )
-                cpu_time = time.time() - start_time
-                results[f'{method}_cpu'] = {
-                    'time_seconds': cpu_time,
+                # Ensure timing includes GPU work
+                cp.cuda.Stream.null.synchronize()
+                gpu_time = time.time() - start_time
+                results[f'{method}_gpu'] = {
+                    'time_seconds': gpu_time,
                     'success': True,
-                    'metadata': cpu_metadata
+                    'metadata': gpu_metadata
                 }
-                
-                # Calculate speedup if both succeeded
-                if self.use_cuda and f'{method}_gpu' in results and results[f'{method}_gpu']['success']:
-                    speedup = cpu_time / gpu_time
-                    results[f'{method}_speedup'] = speedup
-                    
             except Exception as e:
-                results[f'{method}_cpu'] = {
+                results[f'{method}_gpu'] = {
                     'time_seconds': None,
                     'success': False,
                     'error': str(e)

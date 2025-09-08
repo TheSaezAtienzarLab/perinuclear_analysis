@@ -44,5 +44,5 @@ dependencies:
   # Pip dependencies (for packages not available in conda)
   - pip
   - pip:
-    # CUDA packages that need to be installed via pip
-    - cupyx-scipy>=12.0.0  # GPU-accelerated SciPy functions
+    # Add any pip-only dependencies here
+    # - some-pip-only-package>=1.0.0
